@@ -1,0 +1,606 @@
+// main.rs
+
+mod osal;
+mod cpu;
+
+use std::fs::{self, File};
+use std::io::Read;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const CPU: &str = "/sys/devices/system/cpu";
+
+// ---------------------------------------------------------------- helpers ---
+
+fn rd(p: impl AsRef<Path>) -> Option<String> {
+    fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+}
+
+fn rdn(p: impl AsRef<Path>) -> Option<u64> {
+    rd(p)?.parse().ok()
+}
+
+fn section(title: &str) {
+    println!("\n== {title} ==");
+}
+
+fn show(label: &str, v: Option<String>) {
+    println!("  {:<32} {}", label, v.unwrap_or_else(|| "-".into()));
+}
+
+fn onoff(b: u64) -> String {
+    if b & 1 == 1 { "on".into() } else { "off".into() }
+}
+
+fn bits(v: u64, hi: u32, lo: u32) -> u64 {
+    (v >> lo) & ((1u64 << (hi - lo + 1)) - 1)
+}
+
+fn parse_cpulist(s: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in s.split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                    v.extend(a..=b);
+                }
+            }
+            None => {
+                if let Ok(a) = part.parse() {
+                    v.push(a);
+                }
+            }
+        }
+    }
+    v
+}
+
+// --------------------------------------------------------------- cpuinfo ---
+
+#[derive(Default)]
+struct CpuId {
+    vendor: String,
+    model_name: String,
+    family: u32,
+    model: u32,
+    flags: Vec<String>,
+}
+
+fn cpuinfo() -> CpuId {
+    let mut id = CpuId::default();
+    let text = rd("/proc/cpuinfo").unwrap_or_default();
+    // first processor block only
+    for line in text.lines().take_while(|l| !l.trim().is_empty()) {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "vendor_id" => id.vendor = v.into(),
+            "model name" => id.model_name = v.into(),
+            "cpu family" => id.family = v.parse().unwrap_or(0),
+            "model" => id.model = v.parse().unwrap_or(0),
+            "flags" => id.flags = v.split_whitespace().map(String::from).collect(),
+            _ => {}
+        }
+    }
+    id
+}
+
+// ------------------------------------------------------------------- MSR ---
+
+fn msr_open(cpu: usize) -> Option<File> {
+    File::open(format!("/dev/cpu/{cpu}/msr")).ok()
+}
+
+/// pread(fd, buf, 8, reg) on /dev/cpu/N/msr == rdmsr on CPU N (kernel does the IPI).
+/// Unsupported MSRs fail with EIO -> None.
+fn rdmsr(f: &File, reg: u32) -> Option<u64> {
+    let mut b = [0u8; 8];
+    f.read_exact_at(&mut b, reg as u64).ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+const MSR_TSC: u32 = 0x10;
+const MSR_MPERF: u32 = 0xE7;
+const MSR_APERF: u32 = 0xE8;
+const MSR_PLATFORM_INFO: u32 = 0xCE;
+const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
+const MSR_PERF_STATUS: u32 = 0x198;
+const MSR_MISC_ENABLE: u32 = 0x1A0;
+const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
+const MSR_POWER_CTL: u32 = 0x1FC;
+const MSR_RAPL_POWER_UNIT: u32 = 0x606;
+const MSR_PKG_ENERGY_STATUS: u32 = 0x611;
+const MSR_PM_ENABLE: u32 = 0x770;
+const MSR_HWP_CAPABILITIES: u32 = 0x771;
+const MSR_HWP_REQUEST: u32 = 0x774;
+
+/// Core residency counters (tick at TSC rate)
+const CORE_CST: [(u32, &str); 3] = [(0x3FC, "hwC3%"), (0x3FD, "hwC6%"), (0x3FE, "hwC7%")];
+/// Package residency counters (tick at TSC rate)
+const PKG_CST: [(u32, &str); 7] = [
+    (0x60D, "PC2"),
+    (0x3F8, "PC3"),
+    (0x3F9, "PC6"),
+    (0x3FA, "PC7"),
+    (0x630, "PC8"),
+    (0x631, "PC9"),
+    (0x632, "PC10"),
+];
+
+fn pkg_limit_name(v: u64) -> &'static str {
+    // Encoding is model-specific (Intel SDM vol. 4); this is the common client (SKL+) one.
+    match v {
+        0 => "C0/C1",
+        1 => "C2",
+        2 => "C3",
+        3 => "C6",
+        4 => "C7",
+        5 => "C7s",
+        6 => "C8",
+        7 => "C9",
+        8 => "C10",
+        _ => "model-specific",
+    }
+}
+
+// --------------------------------------------------------------- sections ---
+
+fn platform(id: &CpuId, cpus: &[usize]) {
+    section("Platform");
+    show("CPU", Some(id.model_name.clone()));
+    show(
+        "vendor / family / model",
+        Some(format!("{} / {:#x} / {:#x}", id.vendor, id.family, id.model)),
+    );
+    show(
+        "online CPUs",
+        Some(format!("{} ({})", cpus.len(), rd(format!("{CPU}/online")).unwrap_or_default())),
+    );
+    show("kernel", rd("/proc/sys/kernel/osrelease"));
+    show(
+        "clocksource",
+        rd("/sys/devices/system/clocksource/clocksource0/current_clocksource"),
+    );
+    let want = [
+        "constant_tsc", "nonstop_tsc", "aperfmperf", "monitor", "arat", "hwp", "hwp_epp",
+        "hypervisor",
+    ];
+    let flags: Vec<String> = want
+        .iter()
+        .map(|f| format!("{}{f}", if id.flags.iter().any(|x| x == f) { '+' } else { '-' }))
+        .collect();
+    show("CPU flags", Some(flags.join(" ")));
+}
+
+fn cmdline() {
+    section("Kernel command line (power / RT related)");
+    let prefixes = [
+        "intel_idle.", "processor.", "idle=", "intel_pstate", "cpufreq.", "cpuidle.",
+        "isolcpus", "nohz", "rcu_nocbs", "irqaffinity", "tsc=", "clocksource=", "nosmt",
+        "skew_tick", "nosoftlockup", "threadirqs", "preempt=",
+    ];
+    let line = rd("/proc/cmdline").unwrap_or_default();
+    let hits: Vec<&str> = line
+        .split_whitespace()
+        .filter(|t| prefixes.iter().any(|p| t.starts_with(p)))
+        .collect();
+    show(
+        "params",
+        Some(if hits.is_empty() { "(none)".into() } else { hits.join(" ") }),
+    );
+}
+
+fn pm_qos() -> Option<String> {
+    // Reading returns the current aggregated CPU latency target (s32, µs).
+    // Opening adds a request at the default value, which doesn't constrain anything.
+    let mut f = File::open("/dev/cpu_dma_latency").ok()?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).ok()?;
+    let v = i32::from_ne_bytes(b);
+    Some(if v >= 2_000_000_000 { "no limit".into() } else { format!("{v} us") })
+}
+
+fn state_dir(cpu: usize, s: usize) -> String {
+    format!("{CPU}/cpu{cpu}/cpuidle/state{s}")
+}
+
+fn state_indices(cpu: usize) -> Vec<usize> {
+    let mut v: Vec<usize> = fs::read_dir(format!("{CPU}/cpu{cpu}/cpuidle"))
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| e.file_name().to_str()?.strip_prefix("state")?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_unstable();
+    v
+}
+
+fn cpuidle(cpus: &[usize]) {
+    section("cpuidle");
+    let base = format!("{CPU}/cpuidle");
+    show("driver", rd(format!("{base}/current_driver")));
+    show(
+        "governor",
+        rd(format!("{base}/current_governor")).or_else(|| rd(format!("{base}/current_governor_ro"))),
+    );
+    show("available governors", rd(format!("{base}/available_governors")));
+    if let Ok(dir) = fs::read_dir("/sys/module/intel_idle/parameters") {
+        let mut p: Vec<String> = dir
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                rd(e.path()).map(|v| format!("{n}={v}"))
+            })
+            .collect();
+        p.sort();
+        show("intel_idle params", Some(p.join(" ")));
+    }
+    show("PM QoS (/dev/cpu_dma_latency)", pm_qos().or(Some("- (needs root)".into())));
+    let limited: Vec<String> = cpus
+        .iter()
+        .filter_map(|c| {
+            let v = rd(format!("{CPU}/cpu{c}/power/pm_qos_resume_latency_us"))?;
+            (v != "0" && v != "n/a").then(|| format!("cpu{c}={v}us"))
+        })
+        .collect();
+    if !limited.is_empty() {
+        show("per-CPU resume latency limits", Some(limited.join(" ")));
+    }
+
+    let states = state_indices(cpus[0]);
+    if states.is_empty() {
+        println!("  no idle states exposed (idle=poll, cpuidle off, or VM without idle driver)");
+        return;
+    }
+    println!(
+        "\n  {:<4} {:<8} {:>8} {:>10} {:>9} {:>14} {:>12}  description",
+        "idx", "name", "lat(us)", "resid(us)", "disabled", "usage(all)", "time(s,all)"
+    );
+    for s in states {
+        let d0 = state_dir(cpus[0], s);
+        let disabled = cpus
+            .iter()
+            .filter(|&&c| rd(format!("{}/disable", state_dir(c, s))).as_deref() == Some("1"))
+            .count();
+        let usage: u64 = cpus.iter().filter_map(|&c| rdn(format!("{}/usage", state_dir(c, s)))).sum();
+        let time: u64 = cpus.iter().filter_map(|&c| rdn(format!("{}/time", state_dir(c, s)))).sum();
+        let mut desc = rd(format!("{d0}/desc")).unwrap_or_default();
+        if rd(format!("{d0}/default_status")).as_deref() == Some("disabled") {
+            desc.push_str(" [off by default]");
+        }
+        println!(
+            "  {:<4} {:<8} {:>8} {:>10} {:>9} {:>14} {:>12.1}  {}",
+            s,
+            rd(format!("{d0}/name")).unwrap_or_default(),
+            rd(format!("{d0}/latency")).unwrap_or_default(),
+            rd(format!("{d0}/residency")).unwrap_or_default(),
+            format!("{disabled}/{}", cpus.len()),
+            usage,
+            time as f64 / 1e6,
+            desc
+        );
+    }
+}
+
+fn mhz(p: &Path, f: &str) -> String {
+    rdn(p.join(f)).map(|k| (k / 1000).to_string()).unwrap_or_else(|| "-".into())
+}
+
+fn cpufreq() {
+    section("cpufreq / scaling");
+    let base = PathBuf::from(format!("{CPU}/cpufreq"));
+    let mut pol: Vec<(usize, PathBuf)> = fs::read_dir(&base)
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| {
+                    let n: usize = e.file_name().to_str()?.strip_prefix("policy")?.parse().ok()?;
+                    Some((n, e.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pol.sort();
+
+    if pol.is_empty() {
+        println!("  no cpufreq policies (no scaling driver loaded, or VM)");
+    } else {
+        let p0 = &pol[0].1;
+        show("scaling driver", rd(p0.join("scaling_driver")));
+        show("available governors", rd(p0.join("scaling_available_governors")));
+        show("available EPP", rd(p0.join("energy_performance_available_preferences")));
+        show("global boost", rd(base.join("boost")));
+        println!(
+            "\n  {:<7} {:<10} {:<12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  EPP",
+            "policy", "cpus", "governor", "min", "max", "hw_min", "hw_max", "base", "cur"
+        );
+        for (n, p) in &pol {
+            println!(
+                "  {:<7} {:<10} {:<12} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}  {}",
+                n,
+                rd(p.join("affected_cpus")).unwrap_or_default(),
+                rd(p.join("scaling_governor")).unwrap_or_default(),
+                mhz(p, "scaling_min_freq"),
+                mhz(p, "scaling_max_freq"),
+                mhz(p, "cpuinfo_min_freq"),
+                mhz(p, "cpuinfo_max_freq"),
+                mhz(p, "base_frequency"),
+                mhz(p, "scaling_cur_freq"),
+                rd(p.join("energy_performance_preference")).unwrap_or_else(|| "-".into())
+            );
+        }
+        println!("  (MHz)");
+    }
+
+    let ip = format!("{CPU}/intel_pstate");
+    if Path::new(&ip).exists() {
+        let keys = [
+            "status", "no_turbo", "turbo_pct", "num_pstates", "min_perf_pct", "max_perf_pct",
+            "hwp_dynamic_boost", "energy_efficiency",
+        ];
+        let vals: Vec<String> = keys
+            .iter()
+            .filter_map(|k| rd(format!("{ip}/{k}")).map(|v| format!("{k}={v}")))
+            .collect();
+        show("intel_pstate", Some(vals.join(" ")));
+    }
+}
+
+fn msr_section(f: &File) {
+    section("MSRs (read on cpu0; some are core/package scoped)");
+    let r = |reg| rdmsr(f, reg);
+
+    if let Some(v) = r(MSR_PKG_CST_CONFIG_CONTROL) {
+        let lim = bits(v, 3, 0);
+        show("PKG_CST_CONFIG_CONTROL (0xE2)", Some(format!("{v:#x}")));
+        show("  package C-state limit", Some(format!("{lim} ({}, client encoding)", pkg_limit_name(lim))));
+        show("  CFG lock (BIOS locked)", Some(onoff(v >> 15)));
+        show("  auto-demotion", Some(format!("C1={} C3={}", onoff(v >> 26), onoff(v >> 25))));
+        show("  undemotion", Some(format!("C1={} C3={}", onoff(v >> 28), onoff(v >> 27))));
+    }
+    if let Some(v) = r(MSR_POWER_CTL) {
+        show("C1E promotion (0x1FC bit 1)", Some(onoff(v >> 1)));
+    }
+    if let Some(v) = r(MSR_MISC_ENABLE) {
+        show("EIST / SpeedStep (0x1A0 bit 16)", Some(onoff(v >> 16)));
+        show("turbo disabled (0x1A0 bit 38)", Some(onoff(v >> 38)));
+    }
+    if let Some(v) = r(MSR_PLATFORM_INFO) {
+        show(
+            "base / max-efficiency freq",
+            Some(format!("{} / {} MHz", bits(v, 15, 8) * 100, bits(v, 47, 40) * 100)),
+        );
+    }
+    if let Some(v) = r(MSR_PERF_STATUS) {
+        show("cpu0 current ratio (0x198)", Some(format!("{} MHz", bits(v, 15, 8) * 100)));
+    }
+    if let Some(v) = r(MSR_TEMPERATURE_TARGET) {
+        show("TjMax (0x1A2)", Some(format!("{} C", bits(v, 23, 16))));
+    }
+    match r(MSR_PM_ENABLE) {
+        Some(v) if v & 1 == 1 => {
+            show("HWP (0x770)", Some("enabled".into()));
+            if let Some(c) = r(MSR_HWP_CAPABILITIES) {
+                show(
+                    "  caps high/guar/eff/low",
+                    Some(format!(
+                        "{} / {} / {} / {}",
+                        bits(c, 7, 0), bits(c, 15, 8), bits(c, 23, 16), bits(c, 31, 24)
+                    )),
+                );
+            }
+            if let Some(q) = r(MSR_HWP_REQUEST) {
+                show(
+                    "  request min/max/desired/EPP",
+                    Some(format!(
+                        "{} / {} / {} / {}",
+                        bits(q, 7, 0), bits(q, 15, 8), bits(q, 23, 16), bits(q, 31, 24)
+                    )),
+                );
+            }
+        }
+        Some(_) => show("HWP (0x770)", Some("disabled".into())),
+        None => show("HWP (0x770)", Some("not supported".into())),
+    }
+}
+
+// --------------------------------------------------------------- sampling ---
+
+struct Snap {
+    t: Instant,
+    idle_us: Vec<Vec<u64>>,              // [cpu][state] cumulative time (us)
+    core: Vec<Vec<Option<u64>>>,         // [cpu][TSC, APERF, MPERF, C3, C6, C7]
+    pkg: Vec<(u64, Vec<Option<u64>>)>,   // per package: (id, [TSC, energy, PC2..PC10])
+}
+
+fn take_snap(cpus: &[usize], states: &[usize], msr: &[Option<File>], pkgs: &[(u64, usize)]) -> Snap {
+    let mut core = Vec::new();
+    let mut idle_us = Vec::new();
+    for (i, &c) in cpus.iter().enumerate() {
+        idle_us.push(
+            states
+                .iter()
+                .map(|&s| rdn(format!("{}/time", state_dir(c, s))).unwrap_or(0))
+                .collect(),
+        );
+        let regs = [MSR_TSC, MSR_APERF, MSR_MPERF, CORE_CST[0].0, CORE_CST[1].0, CORE_CST[2].0];
+        core.push(regs.iter().map(|&r| msr[i].as_ref().and_then(|f| rdmsr(f, r))).collect());
+    }
+    let pkg = pkgs
+        .iter()
+        .map(|&(id, i)| {
+            let f = msr[i].as_ref();
+            let mut v = vec![
+                f.and_then(|f| rdmsr(f, MSR_TSC)),
+                f.and_then(|f| rdmsr(f, MSR_PKG_ENERGY_STATUS)),
+            ];
+            v.extend(PKG_CST.iter().map(|&(r, _)| f.and_then(|f| rdmsr(f, r))));
+            (id, v)
+        })
+        .collect();
+    Snap { t: Instant::now(), idle_us, core, pkg }
+}
+
+fn d(a: Option<u64>, b: Option<u64>) -> Option<f64> {
+    Some(b?.wrapping_sub(a?) as f64)
+}
+
+fn sample_run(cpus: &[usize], secs: f64, intel: bool) {
+    section(&format!("Sample over {secs} s"));
+    let states = state_indices(cpus[0]);
+    let names: Vec<String> = states
+        .iter()
+        .map(|&s| rd(format!("{}/name", state_dir(cpus[0], s))).unwrap_or_default())
+        .collect();
+    let msr: Vec<Option<File>> =
+        cpus.iter().map(|&c| if intel { msr_open(c) } else { None }).collect();
+
+    // first CPU of each package, for package-scoped MSRs
+    let mut pkgs: Vec<(u64, usize)> = Vec::new();
+    for (i, &c) in cpus.iter().enumerate() {
+        let id = rdn(format!("{CPU}/cpu{c}/topology/physical_package_id")).unwrap_or(0);
+        if !pkgs.iter().any(|p| p.0 == id) {
+            pkgs.push((id, i));
+        }
+    }
+    let energy_unit = msr[0]
+        .as_ref()
+        .and_then(|f| rdmsr(f, MSR_RAPL_POWER_UNIT))
+        .map(|v| 1.0 / (1u64 << bits(v, 12, 8)) as f64);
+
+    let s0 = take_snap(cpus, &states, &msr, &pkgs);
+    thread::sleep(Duration::from_secs_f64(secs));
+    let s1 = take_snap(cpus, &states, &msr, &pkgs);
+    let el_us = (s1.t - s0.t).as_secs_f64() * 1e6;
+
+    // which hw core C-state columns exist (EIO on unsupported MSRs -> None)
+    let hw_cols: Vec<usize> = (0..CORE_CST.len()).filter(|&k| s0.core[0][3 + k].is_some()).collect();
+    let have_aperf = s0.core[0][0].is_some() && s0.core[0][1].is_some() && s0.core[0][2].is_some();
+
+    if !have_aperf && states.is_empty() && hw_cols.is_empty() {
+        println!("  nothing to sample: no cpuidle states and no readable MSRs");
+        return;
+    }
+    let mut hdr = format!("  {:<5}", "CPU");
+    if have_aperf {
+        hdr += &format!(" {:>7} {:>8} {:>8}", "Busy%", "Bzy_MHz", "Avg_MHz");
+    }
+    for n in &names {
+        hdr += &format!(" {:>7}", format!("{:.6}%", n));
+    }
+    for &k in &hw_cols {
+        hdr += &format!(" {:>7}", CORE_CST[k].1);
+    }
+    println!("{hdr}");
+
+    for (i, &c) in cpus.iter().enumerate() {
+        let (a, b) = (&s0.core[i], &s1.core[i]);
+        let mut line = format!("  {:<5}", c);
+        let dtsc = d(a[0], b[0]);
+        if have_aperf {
+            match (dtsc, d(a[1], b[1]), d(a[2], b[2])) {
+                (Some(t), Some(ap), Some(mp)) if t > 0.0 && mp > 0.0 => {
+                    let tsc_mhz = t / el_us;
+                    line += &format!(
+                        " {:>7.2} {:>8.0} {:>8.0}",
+                        100.0 * mp / t,
+                        tsc_mhz * ap / mp,
+                        ap / el_us
+                    );
+                }
+                _ => line += &format!(" {:>7} {:>8} {:>8}", "-", "-", "-"),
+            }
+        }
+        for k in 0..states.len() {
+            let dt = s1.idle_us[i][k].saturating_sub(s0.idle_us[i][k]) as f64;
+            line += &format!(" {:>7.2}", 100.0 * dt / el_us);
+        }
+        for &k in &hw_cols {
+            match (d(a[3 + k], b[3 + k]), dtsc) {
+                (Some(x), Some(t)) if t > 0.0 => line += &format!(" {:>7.2}", 100.0 * x / t),
+                _ => line += &format!(" {:>7}", "-"),
+            }
+        }
+        println!("{line}");
+    }
+
+    for (j, (id, a)) in s0.pkg.iter().enumerate() {
+        let b = &s1.pkg[j].1;
+        let mut parts = Vec::new();
+        if let (Some(e0), Some(e1), Some(u)) = (a[1], b[1], energy_unit) {
+            // energy counter is 32 bits wide and wraps
+            let e = (e1 as u32).wrapping_sub(e0 as u32) as f64;
+            parts.push(format!("PkgWatt={:.2}", e * u / (el_us / 1e6)));
+        }
+        if let Some(t) = d(a[0], b[0]).filter(|t| *t > 0.0) {
+            for (k, &(_, name)) in PKG_CST.iter().enumerate() {
+                if let Some(x) = d(a[2 + k], b[2 + k]) {
+                    parts.push(format!("{name}={:.2}%", 100.0 * x / t));
+                }
+            }
+        }
+        if !parts.is_empty() {
+            println!("  package {id}: {}", parts.join(" "));
+        }
+    }
+    if msr.iter().all(|m| m.is_none()) {
+        println!("  (hardware counters skipped: need root and `modprobe msr`)");
+    }
+    println!("  Idle % columns are OS-requested residency (cpuidle sysfs); hw* columns are what the hardware actually entered.");
+}
+
+// ------------------------------------------------------------------- main ---
+
+fn usage() -> ! {
+    eprintln!("usage: cstate-info [--sample SECONDS]");
+    std::process::exit(2)
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut sample: Option<f64> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" | "--sample" => {
+                sample = args.get(i + 1).and_then(|s| s.parse().ok()).filter(|v: &f64| *v > 0.0);
+                if sample.is_none() {
+                    usage();
+                }
+                i += 1;
+            }
+            "-h" | "--help" => usage(),
+            other => {
+                eprintln!("unknown argument: {other}");
+                usage();
+            }
+        }
+        i += 1;
+    }
+
+    let cpus = rd(format!("{CPU}/online"))
+        .map(|s| parse_cpulist(&s))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![0]);
+    let id = cpuinfo();
+    let intel = id.vendor == "GenuineIntel";
+
+    platform(&id, &cpus);
+    cmdline();
+    cpuidle(&cpus);
+    cpufreq();
+    if intel {
+        match msr_open(cpus[0]) {
+            Some(f) => msr_section(&f),
+            None => {
+                section("MSRs");
+                println!("  skipped: need root and `modprobe msr`");
+            }
+        }
+    }
+    if let Some(secs) = sample {
+        sample_run(&cpus, secs, intel);
+    }
+}s
